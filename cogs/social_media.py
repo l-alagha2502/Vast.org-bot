@@ -118,6 +118,99 @@ async def _check_reddit(
     return None
 
 
+async def _check_instagram(
+    username: str, last_shortcode: Optional[str]
+) -> Optional[dict]:
+    """Return newest Instagram post dict if different from last_shortcode.
+
+    Uses ``instaloader`` in a thread executor to avoid blocking the event loop.
+    Anonymous access is rate-limited; supply credentials via INSTAGRAM_USERNAME /
+    INSTAGRAM_PASSWORD env-vars for more reliable polling.
+    """
+    import asyncio
+
+    def _fetch() -> Optional[dict]:
+        try:
+            import instaloader
+
+            L = instaloader.Instaloader(
+                download_pictures=False,
+                download_videos=False,
+                download_video_thumbnails=False,
+                download_geotags=False,
+                download_comments=False,
+                save_metadata=False,
+                quiet=True,
+            )
+            if BotConfig.INSTAGRAM_USERNAME and BotConfig.INSTAGRAM_PASSWORD:
+                L.login(BotConfig.INSTAGRAM_USERNAME, BotConfig.INSTAGRAM_PASSWORD)
+            profile = instaloader.Profile.from_username(L.context, username)
+            for post in profile.get_posts():
+                # get_posts() returns newest first
+                return {
+                    "shortcode": post.shortcode,
+                    "author": username,
+                    "link": f"https://www.instagram.com/p/{post.shortcode}/",
+                    "title": (post.caption or "")[:200],
+                    "thumbnail": post.url,
+                }
+        except Exception as exc:
+            log.debug("Instagram fetch error for %s: %s", username, exc)
+        return None
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _fetch)
+
+
+async def _check_tiktok(username: str, last_id: Optional[str]) -> Optional[dict]:
+    """Return newest TikTok video dict if different from last_id.
+
+    Uses ``yt-dlp`` in a thread executor to extract playlist metadata without
+    downloading any video content.
+    """
+    import asyncio
+
+    def _fetch() -> Optional[dict]:
+        try:
+            import yt_dlp
+
+            ydl_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "extract_flat": True,
+                "playlistend": 1,
+                "skip_download": True,
+            }
+            url = f"https://www.tiktok.com/@{username}"
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if not info:
+                return None
+            entries = info.get("entries") or []
+            if not entries:
+                return None
+            entry = entries[0]
+            video_id = str(entry.get("id", ""))
+            video_link = (
+                entry.get("url")
+                or entry.get("webpage_url")
+                or f"https://www.tiktok.com/@{username}/video/{video_id}"
+            )
+            return {
+                "id": video_id,
+                "author": username,
+                "link": video_link,
+                "title": entry.get("title", ""),
+                "thumbnail": entry.get("thumbnail", ""),
+            }
+        except Exception as exc:
+            log.debug("TikTok fetch error for %s: %s", username, exc)
+        return None
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _fetch)
+
+
 async def _check_twitter(
     session: aiohttp.ClientSession, username: str, last_id: Optional[str]
 ) -> Optional[dict]:
@@ -174,12 +267,16 @@ class SocialMediaCog(commands.Cog, name="Social Media"):
         self.youtube_poll.start()
         self.twitter_poll.start()
         self.reddit_poll.start()
+        self.instagram_poll.start()
+        self.tiktok_poll.start()
 
     def cog_unload(self) -> None:
         self.twitch_poll.cancel()
         self.youtube_poll.cancel()
         self.twitter_poll.cancel()
         self.reddit_poll.cancel()
+        self.instagram_poll.cancel()
+        self.tiktok_poll.cancel()
         if self._http and not self._http.closed:
             asyncio.create_task(self._http.close())
 
@@ -344,6 +441,68 @@ class SocialMediaCog(commands.Cog, name="Social Media"):
 
     @reddit_poll.before_loop
     async def before_reddit(self) -> None:
+        await self.bot.wait_until_ready()
+
+    # ------------------------------------------------------------------
+    # Instagram
+    # ------------------------------------------------------------------
+
+    @tasks.loop(seconds=BotConfig.INSTAGRAM_POLL)
+    async def instagram_poll(self) -> None:
+        feeds = await self._feeds_for("instagram")
+        for feed in feeds:
+            try:
+                post = await _check_instagram(feed.account_name, feed.last_post_id)
+                if post and post["shortcode"] != feed.last_post_id:
+                    await self._post_feed(
+                        feed,
+                        {
+                            "author": feed.account_name,
+                            "link": post["link"],
+                            "title": post["title"],
+                            "thumbnail": post["thumbnail"],
+                        },
+                    )
+                    async with db_session() as db:
+                        db_feed = await db.get(SocialFeed, feed.id)
+                        if db_feed:
+                            db_feed.last_post_id = post["shortcode"]
+            except Exception as exc:
+                log.debug("Instagram poll error for %s: %s", feed.account_name, exc)
+
+    @instagram_poll.before_loop
+    async def before_instagram(self) -> None:
+        await self.bot.wait_until_ready()
+
+    # ------------------------------------------------------------------
+    # TikTok
+    # ------------------------------------------------------------------
+
+    @tasks.loop(seconds=BotConfig.TIKTOK_POLL)
+    async def tiktok_poll(self) -> None:
+        feeds = await self._feeds_for("tiktok")
+        for feed in feeds:
+            try:
+                video = await _check_tiktok(feed.account_name, feed.last_post_id)
+                if video and video["id"] != feed.last_post_id:
+                    await self._post_feed(
+                        feed,
+                        {
+                            "author": feed.account_name,
+                            "link": video["link"],
+                            "title": video["title"],
+                            "thumbnail": video["thumbnail"],
+                        },
+                    )
+                    async with db_session() as db:
+                        db_feed = await db.get(SocialFeed, feed.id)
+                        if db_feed:
+                            db_feed.last_post_id = video["id"]
+            except Exception as exc:
+                log.debug("TikTok poll error for %s: %s", feed.account_name, exc)
+
+    @tiktok_poll.before_loop
+    async def before_tiktok(self) -> None:
         await self.bot.wait_until_ready()
 
     # ------------------------------------------------------------------

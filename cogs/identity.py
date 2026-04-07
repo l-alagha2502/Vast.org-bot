@@ -21,6 +21,7 @@ from discord import app_commands
 from discord.ext import commands
 from sqlalchemy import select
 
+from config import BotConfig
 from database.base import async_session
 from database.models import BotIdentity
 
@@ -143,7 +144,7 @@ class IdentityCog(commands.Cog, name="Identity"):
         if not self._is_owner(interaction.user.id):
             await interaction.response.send_message("❌ Owner only.", ephemeral=True)
             return
-        self.bot.config.OWNER_ID = user.id
+        BotConfig.OWNER_ID = user.id  # update class-level value for this process lifetime
         async with async_session() as session:
             row = await session.scalar(
                 select(BotIdentity).where(

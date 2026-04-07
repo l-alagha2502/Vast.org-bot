@@ -467,14 +467,28 @@ class MusicCog(commands.Cog, name="Music"):
         async def finished_callback(
             _sink: discord.sinks.WaveSink, _channel: discord.TextChannel, *args
         ) -> None:
+            from pydub import AudioSegment
+
             for user_id, audio in _sink.audio_data.items():
-                buf = io.BytesIO(audio.file.getvalue())
                 user = interaction.guild.get_member(user_id)
                 name = user.display_name if user else str(user_id)
+                wav_bytes = audio.file.getvalue()
+                # Convert WAV → MP3 using pydub (requires ffmpeg on PATH)
+                try:
+                    segment = AudioSegment.from_wav(io.BytesIO(wav_bytes))
+                    mp3_buf = io.BytesIO()
+                    segment.export(mp3_buf, format="mp3", bitrate="128k")
+                    mp3_buf.seek(0)
+                    out_buf: io.BytesIO = mp3_buf
+                    filename = f"{name}.mp3"
+                except Exception as conv_err:
+                    log.warning("WAV→MP3 conversion failed for %s: %s", name, conv_err)
+                    out_buf = io.BytesIO(wav_bytes)
+                    filename = f"{name}.wav"
                 try:
                     await interaction.user.send(
-                        f"🎙️ Recording from {name}:",
-                        file=discord.File(buf, filename=f"{name}.wav"),
+                        f"🎙️ Recording from **{name}**:",
+                        file=discord.File(out_buf, filename=filename),
                     )
                 except discord.Forbidden:
                     pass
